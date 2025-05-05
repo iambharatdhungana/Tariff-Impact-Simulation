@@ -1,268 +1,201 @@
-# Author: iambharatdhungana
-# Date: 04/29/2025
+# author: iambharatdhungana
+# date: 05/04/2025
+# purpose: tradetariff-semiconductors
 
-
-import numpy as np, pandas as pd, statsmodels.api as sm
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
-
-# Read quarterly trade data 
+# Read quaterly trade data and convert to PeriodIndex with quarterly frequency 
 
 imports_q = pd.read_csv("data/quarterly_imports.csv")
 exports_q = pd.read_csv("data/quarterly_exports.csv")
+imports_q["Quarter"] = pd.PeriodIndex(imports_q["Quarter"], freq="Q")
+exports_q["Quarter"] = pd.PeriodIndex(exports_q["Quarter"], freq="Q")
 
 # Merge imports and exports data on the "Quarter" column
-# and convert the "Quarter" column to a PeriodIndex with quarterly frequency
+# and convert the "Quarter" column to a PeriodIndex with quarterly frequency.
+# Missing values are filled with 0.
 
-trade_q  = imports_q.merge(exports_q, on="Quarter").assign(
-    Quarter=lambda d: pd.PeriodIndex(d["Quarter"], freq="Q"))
-
-# Read FRED data files
-
-ip_semi = pd.read_csv("data/IPG3344SQ.csv")
-ip_farm = pd.read_csv("data/IPG333111SQ.csv")
-ppi_semi = pd.read_csv("data/PCU33443344.csv")
-ppi_farm = pd.read_csv("data/PCU333111333111P.csv")
-impprice_semi = pd.read_csv("data/IR21320.csv")
-
-# Rename  first column to DATE and second to specified column name
-
-ip_semi.columns = ["DATE", "IP_semi"]
-ip_farm.columns = ["DATE", "IP_farm"]
-ppi_semi.columns = ["DATE", "PPI_semi"]
-ppi_farm.columns = ["DATE", "PPI_farm"]
-impprice_semi.columns = ["DATE", "IMPprice_semi"]
-
-# Convert DATE to datetime format and create a Quarter column
-# using PeriodIndex with quarterly frequency
-
-for df in [ip_semi, ip_farm, ppi_semi, ppi_farm, impprice_semi]:
-    df["DATE"] = pd.to_datetime(df["DATE"])
-    df["Quarter"] = pd.PeriodIndex(df["DATE"], freq="Q")
-
-# Since few of the FRED datasets are monthy average, aggregate monthly data to quarterly averages (if needed)
-# and group by Quarter to get the mean values
+trade_idx = (imports_q.set_index("Quarter")
+                        .join(exports_q.set_index("Quarter"), how="outer")
+                        .fillna(0))                        
 
 
-ip_semi = ip_semi.groupby("Quarter", as_index=False)["IP_semi"].mean()
-ip_farm = ip_farm.groupby("Quarter", as_index=False)["IP_farm"].mean()
-ppi_semi = ppi_semi.groupby("Quarter", as_index=False)["PPI_semi"].mean()
-ppi_farm = ppi_farm.groupby("Quarter", as_index=False)["PPI_farm"].mean()
-impprice_semi = impprice_semi.groupby("Quarter", as_index=False)["IMPprice_semi"].mean()
+# Read the FRED data (dimestic industrial prodution, PPI and world price for semiconductors in US) and rename columns for each file
 
-# Merge all series of FRED dataset into one DataFrame on 'Quarter'
+ip_semi = pd.read_csv("data/IPG3344SQ.csv", names=["DATE", "IP_semi"], header=0)
+ppi_semi = pd.read_csv("data/PCU33443344.csv", names=["DATE", "PPI_semi"], header=0)
+pw_semi = pd.read_csv("data/IR21320.csv", names=["DATE", "PW_semi"], header=0)
 
-fred_df = ip_semi.merge(ip_farm, on="Quarter") \
-                 .merge(ppi_semi, on="Quarter") \
-                 .merge(ppi_farm, on="Quarter") \
-                 .merge(impprice_semi, on="Quarter")
+# Convert DATE to datetime and create a Quarter column using PeriodIndex with quarterly frequency
 
-# Filter by quarter range to include only the desired period (2015Q1 to 2024Q4)
+for df_item in [ip_semi, ppi_semi, pw_semi]:
+    df_item["DATE"] = pd.to_datetime(df_item["DATE"])
+    df_item["Quarter"] = pd.PeriodIndex(df_item["DATE"], freq="Q")
 
-fred_df = fred_df[(fred_df["Quarter"] >= "2015Q1") & (fred_df["Quarter"] <= "2024Q4")]
+# Group by Quarter and average if data are monthly since few of the FRED datasets are monthly averages
 
-# Merge with trade_q dataset created earlier 
-# and fill missing values with 0, then reset the index
+IP = ip_semi.groupby("Quarter", as_index=True)["IP_semi"].mean().to_frame()
+PPI = ppi_semi.groupby("Quarter", as_index=True)["PPI_semi"].mean().to_frame()
+PW = pw_semi.groupby("Quarter", as_index=True)["PW_semi"].mean().to_frame()
 
-data = fred_df.merge(trade_q, on="Quarter", how="left").fillna(0).reset_index(drop=True)
+# Join all FRED series & trade data to trim to 2015‑24 (the period of interest)
+# and fill missing values with 0
 
+df = (IP.join(PPI, how="inner")
+        .join(PW, how="inner")
+        .join(trade_idx, how="left")
+        .fillna(0))
 
-# Calculate consumption volumes and assign domestic/world price indexes
+df = df.loc["2015Q1":"2024Q4"]
 
-data["Cons_Semi_vol"] = data["IP_semi"] + (data["Imports_Semi_USD"] - data["Exports_Semi_USD"]) / data["IMPprice_semi"]
-data["Cons_Farm_vol"] = data["IP_farm"] + (data["Imports_Farm_USD"] - data["Exports_Farm_USD"]) / data["PPI_farm"]
+# Build Proxy Demand, Supply (buyers' price) & World Price
 
-data["Price_Semi_dom"] = data["PPI_semi"]
-data["Price_Farm_dom"] = data["PPI_farm"]
-data["Price_Semi_world"] = data["IMPprice_semi"]
-data["Price_Farm_world"] = data["PPI_farm"]
+df["Cons_vol"] = df["IP_semi"] + (df["Imports_Semi_USD"] - df["Exports_Semi_USD"]) / df["PW_semi"]
+df["Price_dom"] = df["PPI_semi"]   
+df["Price_w"] = df["PW_semi"]
 
-for c in ("Cons_Semi_vol", "Cons_Farm_vol", "IP_semi", "IP_farm",
-          "Price_Semi_dom", "Price_Farm_dom"):
-    data[c] = data[c].replace(0, 1e-6)
+# Solving for the baseline equilibrium (2015‑24 mean)
 
-data = data.loc[(data["Cons_Semi_vol"] > 0) & (data["Cons_Farm_vol"] > 0) &
-                (data["IP_semi"] > 0) & (data["IP_farm"] > 0)].reset_index(drop=True)
+P0  = df["Price_dom"].mean()
+Qd0 = df["Cons_vol"].mean()
+Qs0 = df["IP_semi"].mean()
+gap0 = Qd0 - Qs0                         
 
-# Estimate demand and supply elasticities 
+# Imports & Exports flow to be used in the model
 
-eq = {}
-for prod in ("Semi", "Farm"):
-    lnQd = np.log(data[f"Cons_{prod}_vol"])
-    lnPd = np.log(data[f"Price_{prod}_dom"])
-    E_d = sm.OLS(lnQd, sm.add_constant(lnPd)).fit().params.iloc[1]
-    lnQs = np.log(data[f"IP_{prod.lower()}"])
-    E_s = sm.OLS(lnQs, sm.add_constant(lnPd)).fit().params.iloc[1]
-    Q_mean, P_mean = data[f"Cons_{prod}_vol"].mean(), data[f"Price_{prod}_dom"].mean()
-    eq[prod] = {
-        "A_d": Q_mean - E_d * Q_mean,
-        "B_d": E_d * Q_mean / P_mean,
-        "A_s": Q_mean - E_s * Q_mean,
-        "B_s": E_s * Q_mean / P_mean
-    }
-    print(f"{prod}: E_d = {E_d:.2f}, E_s = {E_s:.2f}")
+M0   = max(gap0, 0)                      
+X0   = max(-gap0, 0)                     
 
-# Define simulation function for tariff impacts
+print(f"Equilibrium price   P* = {P0:.2f}")
+print(f"Equilibrium quantity Q* = {Qs0 + M0:.2f}")
+print(f"Quantity simplification Q_d = {Qd0:.2f}   Q_s = {Qs0:.2f}   Imports = {M0:.2f}")
 
-Pw_semi = data["Price_Semi_world"].mean()
-Pw_farm = data["Price_Farm_world"].mean()
-def simulate(prod, t):
-    Pw = Pw_semi if prod == "Semi" else Pw_farm
-    P = Pw * (1 + t)
-    p = eq[prod]
-    Qd = p["A_d"] + p["B_d"] * P
-    Qs = p["A_s"] + p["B_s"] * P
-    return P, Qd, Qs, max(Qd - Qs, 0)
+# Elastictitie value (From literature reviews; plan was to estimate them from data but its now a future work)
 
-# Pre-tariff equilibrium (t = 0)
+eps_d = -0.80          
+eps_s =  2.00          
+print(f"\nElasticities  E_d = {eps_d},  E_s = {eps_s}")
 
-equilibrium_tariff = 0.0
-price_eq, Qd_eq, Qs_eq, imports_eq = simulate("Semi", equilibrium_tariff)
+# Demand & Supply curves (linear) for the baseline equilibrium with elasticities
 
-print("Pre-Tariff Equilibrium")
-print(f"Domestic Price: ${price_eq:.2f}")
-print(f"Quantity Demanded: {Qd_eq:.2f}")
-print(f"Quantity Supplied: {Qs_eq:.2f}")
-print(f"Imports: {imports_eq:.2f}")
-print()
+Bd = eps_d * Qd0 / P0 ;  Ad = Qd0 - Bd * P0      
+Bs = eps_s * Qs0 / P0 ;  As = Qs0 - Bs * P0
 
-# Tariff scenario. Using a 10% (0.10) tariff as an example
+def demand_inv(Q): return (Q - Ad)/Bd            
+def supply_inv(Q): return (Q - As)/Bs           
 
-tariff_rate = 0.10  
-price, quantity_demanded, quantity_supplied, imports = simulate("Semi", tariff_rate)
+# World price (mean) for semiconductors (This is the price that would prevail in the absence of tariffs)
 
-print(f"With {tariff_rate*100:.0f}% Tariff")
-print(f"Domestic Price: ${price:.2f}")
-print(f"Quantity Demanded: {quantity_demanded:.2f}")
-print(f"Quantity Supplied: {quantity_supplied:.2f}")
-print(f"Imports: {imports:.2f}")
+Pw_mean = df["Price_w"].mean()                  
 
-# Monte Carlo simulation: simulate tariff effects 1000 times for both products
-# Here we generate 1000 random tariff rates between 0 and 30% and capture the domestic price
-# and consumption outcomes for each product.
+# Defining the function to solve for the equilibrium price, demand, supply, gap, imports and exports, tax burden according to the tariff rate
+# I used 20% as a sample tariff rate, but this can be changed to any value.
+
+def solve(tariffs):
+    Pb = Pw_mean * (1 + tariffs)                    
+    Q_d = Ad + Bd * Pb                          
+    Q_s = As + Bs * Pb                         
+    gap = Q_d - Q_s
+    imports = max(gap, 0)
+    exports = max(-gap, 0)
+    return Pb, Q_d, Q_s, gap, imports, exports
+
+tariffs = 0.2
+Pb1, Qd1, Qs1, gap1, M1, X1 = solve(tariffs)
+
+buyer_share  = eps_s / (eps_s - eps_d)
+seller_share = 1 - buyer_share
+
+print(f"\n—— TARIFF  τ = {tariffs*100:.0f}% ——")
+print(f"Buyer price   Pb = {Pb1:.2f}")
+print(f"Demand Q_d    = {Qd1:.2f}")
+print(f"Supply Q_s    = {Qs1:.2f}")
+print(f"Gap Q_d – Q_s = {gap1:.2f}")
+print(f"Imports       = {M1:.2f}   Exports = {X1:.2f}")
+print(f"burden: buyers {buyer_share:.1%} , sellers {seller_share:.1%}")
+
+# Simulate the model for a range of tariff rates (0 to 40%) using Monte Carlo simulation.
+# This will help us understand the distribution of the gap and imports across different tariff rates.
+# Generate 1000 random tariff rates between 0 and 40% and capture the domestic price, demand, supply, gap, imports and exports for each rate.  
+# The results are stored in lists for plots.
 
 np.random.seed(0)
-draws = np.random.uniform(0, 0.30, 1000)
-semi_results = np.array([simulate("Semi", t) for t in draws])
-farm_results = np.array([simulate("Farm", t) for t in draws])
-mc_df = pd.DataFrame({
-    "Semi_P": semi_results[:, 0],
-    "Semi_Q": semi_results[:, 1],
-    "Farm_P": farm_results[:, 0],
-    "Farm_Q": farm_results[:, 1]
-})
+draws = np.random.uniform(0, 0.30, 1_000)
+mc_price = [solve(t)[0] for t in draws]
+mc_qty   = [solve(t)[1] for t in draws]
 
 
-# Log-log scatter for both products
+# Plots
 
-for prod, color in [("Semi", "tab:blue"), ("Farm", "tab:green")]:
-    plt.figure()
-    lnP = np.log(data[f"Price_{prod}_dom"])
-    lnQ = np.log(data[f"Cons_{prod}_vol"])
-    plt.scatter(lnP, lnQ, alpha=.7, color=color)
-    m, b = np.polyfit(lnP, lnQ, 1)
-    plt.plot(lnP, m * lnP + b, color="red")
-    plt.xlabel("ln Price")
-    plt.ylabel("ln Quantity")
-    plt.title(f"Demand scatter – {prod} (E ≈ {m:.2f})")
-    plt.show()
+plt.style.use("default")
 
-# Supply–Demand diagrams (Quantity x Price) for both products
-for prod in ("Semi", "Farm"):
-    p = eq[prod]
-    Qgrid = np.linspace(data[f"Cons_{prod}_vol"].min() * 0.5,
-                        data[f"Cons_{prod}_vol"].max() * 1.5, 120)
-    P_d = (Qgrid - p["A_d"]) / p["B_d"]
-    P_s = (Qgrid - p["A_s"]) / p["B_s"]
-    Pw = Pw_semi if prod == "Semi" else Pw_farm
-    t = 0.10
-    Pt = Pw * (1 + t)
-    plt.figure()
-    plt.plot(Qgrid, P_d, label="Demand")
-    plt.plot(Qgrid, P_s, label="Supply")
-    plt.hlines([Pw, Pt], Qgrid.min(), Qgrid.max(),
-               colors=["gray", "black"], linestyles=[":", "--"],
-               label=["World price", f"Pw(1+{t:.0%})"])
-    plt.xlabel("Quantity idx")
-    plt.ylabel("Price idx")
-    plt.title(f"S-D diagram (t=10 %) – {prod}")
-    plt.legend()
-    plt.show()
+# Production vs Domestic price (2015‑24) of semiconductors in the US
 
-# Monte Carlo price histogram (Semiconductors)
-plt.figure()
-plt.hist(mc_df["Semi_P"], bins=30, color="steelblue")
-plt.xlabel("Domestic price idx")
-plt.title("MC Price distribution – Semi")
-plt.show()
-
-
-# Price & quantity over time  (one panel per product, no twin axes)
-for prod, color in [("Semi", "tab:blue"), ("Farm", "tab:green")]:
-    plt.figure(figsize=(9,4))
-    plt.plot(data["Quarter"].astype(str),
-             data[f"Price_{prod}_dom"], label="Price index", color=color)
-    plt.plot(data["Quarter"].astype(str),
-             data[f"Cons_{prod}_vol"], label="Quantity index",
-             color="tab:orange", linestyle="--")
-    plt.title(f"{prod}: Price vs Quantity (2015–24)")
-    plt.xlabel("Quarter")
-    plt.ylabel("Index (base=100)")
-    plt.xticks(rotation=45)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-# Log-log demand scatter with fitted line
-for prod, color in [("Semi", "tab:blue"), ("Farm", "tab:green")]:
-    lnP = np.log(data[f"Price_{prod}_dom"])
-    lnQ = np.log(data[f"Cons_{prod}_vol"])
-    m, b = np.polyfit(lnP, lnQ, 1)
-    plt.figure(figsize=(5,4))
-    plt.scatter(lnP, lnQ, alpha=0.6, color=color)
-    plt.plot(lnP, m*lnP + b, color="red")
-    plt.title(f"{prod} demand | E ≈ {m:.2f}")
-    plt.xlabel("ln Price")
-    plt.ylabel("ln Quantity")
-    plt.tight_layout()
-    plt.show()
-
-# Imports vs tariff curve  (example – semiconductors)
-t_grid = np.linspace(0, 0.30, 61)          # 0 % – 30 %
-imports = [simulate("Semi", t)[3] for t in t_grid]
-
-plt.figure(figsize=(6,4))
-plt.plot(t_grid*100, imports)
-plt.title("Semiconductor imports vs tariff")
-plt.xlabel("Tariff rate (%)")
-plt.ylabel("Import volume index")
+dates = df.index.to_timestamp()
+fig, ax1 = plt.subplots(figsize=(9,3))
+ax1.plot(dates, df["IP_semi"], label="Prod. index", color="tab:green")
+ax1.set_ylabel("Production index")
+ax2 = ax1.twinx()
+ax2.plot(dates, df["Price_dom"], label="Domestic price", color="tab:red")
+ax2.set_ylabel("Price index")
+ax1.xaxis.set_major_locator(mdates.YearLocator())
+ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.setp(ax1.get_xticklabels(), rotation=45, ha='right')
+plt.title("Production & Domestic Price")
+lines = ax1.get_lines() + ax2.get_lines()
+plt.legend(lines,[l.get_label() for l in lines])
 plt.tight_layout()
+plt.savefig("plots/production_domestic_price.png")
 plt.show()
 
+# Equilibrium S‑D diagram
 
-# Monte-Carlo analysis
-plt.figure(figsize=(9,3))
+Qgrid = np.linspace(0.5*Qs0, 1.5*Qd0, 250)
+Pd = demand_inv(Qgrid);  Ps = supply_inv(Qgrid)
+plt.figure(figsize=(6,5))
+plt.plot(Qgrid, Pd, label="Demand")
+plt.plot(Qgrid, Ps, label="Supply")
+plt.scatter([Qd0],[P0],color="black",label="Baseline (P0,Q0)")
+plt.xlabel("Quantity"); plt.ylabel("Price")
+plt.title("Baseline Demand & Supply"); plt.legend(); plt.tight_layout()
+plt.savefig("plots/baseline_demand_supply.png")
+plt.show()
+
+# Tariff S‑D diagram (20% tariff) with tax burden
+
+plt.figure(figsize=(6,5))
+plt.plot(Qgrid, demand_inv(Qgrid), label="Demand")
+plt.plot(Qgrid, supply_inv(Qgrid), label="Supply")
+plt.hlines(Pw_mean, Qgrid.min(), Qd1, color="gray", linestyle=":", label="World price")
+plt.hlines(Pb1, Qgrid.min(), Qd1, color="black", linestyle="--", label="Buyer price after tariff")
+plt.vlines(Qd1, Pw_mean, Pb1, color="red", label="Tariff tax")
+plt.scatter([Qd1], [Pb1], color="black")
+plt.xlabel("Quantity")
+plt.ylabel("Price")
+plt.title("Tariff S–D Diagram (tariff = 20%)")
+plt.legend()
+plt.tight_layout()
+plt.savefig("plots/tariffs_20percent.png")
+plt.show()
+
+# Monte‑Carlo histogram of *gap* (imports positive, exports negative)
+
+plt.figure(figsize=(10,4))
 plt.subplot(1,2,1)
-plt.hist(mc_df["Semi_P"], bins=30, color="tab:blue", alpha=0.8)
-plt.title("Semiconductor price (MC)")
-plt.xlabel("Price index"); plt.ylabel("Frequency")
-
-plt.subplot(1,2,2)
-plt.hist(mc_df["Farm_P"], bins=30, color="tab:green", alpha=0.8)
-plt.title("Farm-machinery price (MC)")
+plt.hist(mc_price, bins=30, color="darkblue")
+plt.title("MC Buyer Price")
 plt.xlabel("Price index")
-plt.tight_layout(); plt.show()
-
-#  Histogram of quantities
-plt.figure(figsize=(9,3))
-plt.subplot(1,2,1)
-plt.hist(mc_df["Semi_Q"], bins=30, color="tab:blue", alpha=0.8)
-plt.title("Semiconductor quantity (MC)")
-plt.xlabel("Quantity index"); plt.ylabel("Frequency")
-
+plt.ylabel("Frequency")        
 plt.subplot(1,2,2)
-plt.hist(mc_df["Farm_Q"], bins=30, color="tab:green", alpha=0.8)
-plt.title("Farm-machinery quantity (MC)")
+plt.hist(mc_qty, bins=30, color="darkorange")
+plt.title("MC Quantity")
 plt.xlabel("Quantity index")
-plt.tight_layout(); plt.show()
+plt.ylabel("Frequency")        
+plt.tight_layout()
+plt.savefig("plots/monte_carlo_histogram.png")
+plt.show()
+
 
