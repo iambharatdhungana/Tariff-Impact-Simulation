@@ -100,6 +100,6 @@ In our Monte Carlo analysis, we ran 1,000 simulations with a tariff randomly cho
 ---
 
 ## Future Work  
-1. Replace proxies data with .  
+1. Replace proxies data with more closer data using instrument variable.  
 2. Estimate non-linear demand and supply (e.g., log–log regressions).  
 
